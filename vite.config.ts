@@ -1,9 +1,25 @@
-import { defineConfig } from 'vite'
+import { defineConfig, Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
+// Health check plugin for backend readiness verification
+function healthCheckPlugin(): Plugin {
+  return {
+    name: 'health-coder',
+    configureServer(server) {
+      server.middlewares.use('/health-coder', (_req, res) => {
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({
+          status: 'ok',
+          timestamp: Date.now(),
+        }))
+      })
+    }
+  }
+}
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), healthCheckPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
