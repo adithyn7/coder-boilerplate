@@ -8,6 +8,9 @@ function healthCheckPlugin(): Plugin {
     name: 'health-coder',
     configureServer(server) {
       server.middlewares.use('/health-coder', (_req, res) => {
+        res.setHeader('Access-Control-Allow-Origin', '*')
+        res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
         res.setHeader('Content-Type', 'application/json')
         res.end(JSON.stringify({
           status: 'ok',
