@@ -6,6 +6,7 @@ function App() {
   return (
     <Routes>
       <Route path="/" element={<Home />} />
+      <Route path="/index.html" element={<Navigate to="/" replace />} />
       {/* Add more routes here */}
       <Route path="*" element={<NotFound />} />
     </Routes>
