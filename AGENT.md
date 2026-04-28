@@ -153,56 +153,143 @@ const deleteItem = async (id: string) => {
 
 ## Authentication
 
-### Auth Hook
-```tsx
-// src/hooks/useAuth.ts
-import { useEffect, useState } from 'react'
-import { supabase } from '@/lib/supabase'
-import type { User } from '@supabase/supabase-js'
+**This sandbox uses SuperAGI OIDC ("Sign in with SuperAGI") as the only auth method.** Do not generate email/password forms, do not generate `/login` or `/signup` routes, and do not call `supabase.auth.signInWithPassword` or `supabase.auth.signUp`. Server-side OIDC provider registration is fully automated by coder-service — no Supabase dashboard configuration is needed and you should not instruct the user to do any. The provider identifier is `custom:superagi` and the user's `auth.uid()` equals their SuperAGI `auth_users.id`, so RLS policies work without custom mapping.
 
-export function useAuth() {
-  const [user, setUser] = useState<User | null>(null)
+### Auth Provider (`src/context/AuthProvider.tsx`)
+```tsx
+import { createContext, useContext, useEffect, useState, ReactNode } from 'react'
+import type { Session, User } from '@supabase/supabase-js'
+import { supabase } from '@/lib/supabase'
+
+type AuthCtx = { user: User | null; session: Session | null; loading: boolean }
+const Ctx = createContext<AuthCtx>({ user: null, session: null, loading: true })
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user ?? null)
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session)
       setLoading(false)
     })
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, session) => setUser(session?.user ?? null)
-    )
-
-    return () => subscription.unsubscribe()
+    const { data: sub } = supabase.auth.onAuthStateChange((_, s) => setSession(s))
+    return () => sub.subscription.unsubscribe()
   }, [])
 
-  const signIn = (email: string, password: string) =>
-    supabase.auth.signInWithPassword({ email, password })
+  return <Ctx.Provider value={{ user: session?.user ?? null, session, loading }}>{children}</Ctx.Provider>
+}
 
-  const signUp = (email: string, password: string) =>
-    supabase.auth.signUp({ email, password })
+export const useAuth = () => useContext(Ctx)
+```
 
-  const signOut = () => supabase.auth.signOut()
+### Sign-In Button (`src/components/SignInButton.tsx`)
+```tsx
+import { Button } from '@/components/ui/button'
+import { supabase } from '@/lib/supabase'
 
-  return { user, loading, signIn, signUp, signOut }
+export function SignInButton() {
+  return (
+    <Button
+      onClick={() =>
+        supabase.auth.signInWithOAuth({
+          provider: 'custom:superagi',
+          options: { redirectTo: window.location.href },
+        })
+      }
+      size="lg"
+    >
+      Sign in with SuperAGI
+    </Button>
+  )
 }
 ```
 
-### Protected Route
+### Sign-In Page (`src/pages/SignInPage.tsx`)
 ```tsx
-// src/components/ProtectedRoute.tsx
-import { Navigate } from 'react-router-dom'
-import { useAuth } from '@/hooks/useAuth'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { SignInButton } from '@/components/SignInButton'
 
-export function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { user, loading } = useAuth()
+export function SignInPage({ appName }: { appName: string }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center p-4">
+      <Card className="w-full max-w-md text-center">
+        <CardHeader>
+          <CardTitle className="text-2xl">{appName}</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <SignInButton />
+          <p className="text-sm text-muted-foreground">
+            You'll be signed in using your SuperAGI account. No extra password needed.
+          </p>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+```
 
-  if (loading) return <div>Loading...</div>
-  if (!user) return <Navigate to="/login" replace />
+### Auth Gate (`src/components/AuthGate.tsx`)
 
+Wraps protected content. Auto-triggers silent SSO when the app is opened from inside super_sales (so the user never sees a login screen); shows the `<SignInPage />` button otherwise.
+
+```tsx
+import { useEffect, ReactNode } from 'react'
+import { useAuth } from '@/context/AuthProvider'
+import { SignInPage } from '@/pages/SignInPage'
+import { supabase } from '@/lib/supabase'
+
+function isEmbeddedLaunch() {
+  if (typeof window === 'undefined') return false
+  if (new URLSearchParams(window.location.search).get('source') === 'super_sales') return true
+  if (document.referrer.startsWith('https://sales.superagi.com')) return true
+  if (document.cookie.split(';').some(c => c.trim().startsWith('_superagi_session_'))) return true
+  return false
+}
+
+export function AuthGate({ children, appName }: { children: ReactNode; appName: string }) {
+  const { session, loading } = useAuth()
+
+  useEffect(() => {
+    if (loading || session) return
+    if (isEmbeddedLaunch()) {
+      supabase.auth.signInWithOAuth({
+        provider: 'custom:superagi',
+        options: { redirectTo: window.location.href },
+      })
+    }
+  }, [loading, session])
+
+  if (loading || (!session && isEmbeddedLaunch())) {
+    return <div className="min-h-screen flex items-center justify-center text-muted-foreground">Loading…</div>
+  }
+  if (!session) return <SignInPage appName={appName} />
   return <>{children}</>
 }
+```
+
+### Wrap Routes in `App.tsx`
+```tsx
+import { AuthProvider } from '@/context/AuthProvider'
+import { AuthGate } from '@/components/AuthGate'
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AuthGate appName="My App">
+        <Routes>
+          {/* protected routes here */}
+        </Routes>
+      </AuthGate>
+    </AuthProvider>
+  )
+}
+```
+
+### Reading user / signing out
+```tsx
+const { user } = useAuth()
+await supabase.auth.signOut()
 ```
 
 ---
