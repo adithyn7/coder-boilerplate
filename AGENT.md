@@ -174,7 +174,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setLoading(false)
     })
     const { data: sub } = supabase.auth.onAuthStateChange((_, s) => setSession(s))
-    return () => sub.subscription.unsubscribe()
+
+    // When sign-in happens in a popup (iframed-app case), the popup writes
+    // the session to localStorage and closes. onAuthStateChange does NOT
+    // fire across windows by default, so listen for the storage event and
+    // refresh our session when Supabase's `sb-*` keys change.
+    const onStorage = (e: StorageEvent) => {
+      if (e.key && e.key.startsWith('sb-')) {
+        supabase.auth.getSession().then(({ data }) => setSession(data.session))
+      }
+    }
+    window.addEventListener('storage', onStorage)
+
+    return () => {
+      sub.subscription.unsubscribe()
+      window.removeEventListener('storage', onStorage)
+    }
   }, [])
 
   return <Ctx.Provider value={{ user: session?.user ?? null, session, loading }}>{children}</Ctx.Provider>
@@ -184,21 +199,61 @@ export const useAuth = () => useContext(Ctx)
 ```
 
 ### Sign-In Button (`src/components/SignInButton.tsx`)
+
+When the app is embedded inside an iframe (e.g. the SuperAGI editor's preview pane), a direct redirect breaks because OAuth providers refuse to be iframed (`X-Frame-Options` / `frame-ancestors`). Use a popup instead — it's a top-level browsing context, so the OAuth chain renders fine inside it, and Supabase persists the session to `localStorage` which the parent picks up via the storage event listener in `AuthProvider`.
+
 ```tsx
 import { Button } from '@/components/ui/button'
 import { supabase } from '@/lib/supabase'
 
+async function startSignIn() {
+  const isFramed = typeof window !== 'undefined' && window.self !== window.top
+
+  // Standalone: keep simple direct-redirect — fewer moving parts, popup
+  // blockers don't apply.
+  if (!isFramed) {
+    await supabase.auth.signInWithOAuth({
+      provider: 'custom:superagi',
+      options: { redirectTo: window.location.href },
+    })
+    return
+  }
+
+  // Iframed: open the popup SYNCHRONOUSLY in the click handler — browsers
+  // block popups opened after async work. Navigate it once Supabase
+  // returns the constructed URL.
+  const popup = window.open(
+    'about:blank',
+    'superagi-auth',
+    'width=480,height=720,scrollbars=yes',
+  )
+  if (!popup) {
+    // Popup blocked. Last-resort fallback: navigate the whole tab.
+    const { data } = await supabase.auth.signInWithOAuth({
+      provider: 'custom:superagi',
+      options: { redirectTo: window.location.href, skipBrowserRedirect: true },
+    })
+    if (data?.url && window.top) window.top.location.href = data.url
+    return
+  }
+
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: 'custom:superagi',
+    options: {
+      redirectTo: window.location.href,
+      skipBrowserRedirect: true,
+    },
+  })
+  if (error || !data?.url) {
+    popup.close()
+    return
+  }
+  popup.location.href = data.url
+}
+
 export function SignInButton() {
   return (
-    <Button
-      onClick={() =>
-        supabase.auth.signInWithOAuth({
-          provider: 'custom:superagi',
-          options: { redirectTo: window.location.href },
-        })
-      }
-      size="lg"
-    >
+    <Button onClick={startSignIn} size="lg">
       Sign in with SuperAGI
     </Button>
   )
@@ -247,12 +302,24 @@ function isEmbeddedLaunch() {
   return false
 }
 
+// Iframed in a parent window (e.g. the SuperAGI editor's preview pane).
+// Auto-trigger via direct redirect would dead-end here because OAuth
+// providers refuse to be iframed. The user must click the button, which
+// opens a popup (see SignInButton).
+function isIframed() {
+  return typeof window !== 'undefined' && window.self !== window.top
+}
+
 export function AuthGate({ children, appName }: { children: ReactNode; appName: string }) {
   const { session, loading } = useAuth()
 
   useEffect(() => {
     if (loading || session) return
-    if (isEmbeddedLaunch()) {
+    // Only auto-trigger when embedded AND not inside an iframe — direct
+    // redirect from inside an iframe gets blocked by frame-busting headers
+    // on the OAuth pages. In the iframed case, fall through to render
+    // SignInPage so the user clicks the button (which opens a popup).
+    if (isEmbeddedLaunch() && !isIframed()) {
       supabase.auth.signInWithOAuth({
         provider: 'custom:superagi',
         options: { redirectTo: window.location.href },
@@ -260,7 +327,10 @@ export function AuthGate({ children, appName }: { children: ReactNode; appName: 
     }
   }, [loading, session])
 
-  if (loading || (!session && isEmbeddedLaunch())) {
+  // Show Loading… only while the silent auto-redirect is in flight.
+  // Inside an iframe we skip auto-redirect, so we show the SignInPage
+  // immediately instead of a loader that would hang forever.
+  if (loading || (!session && isEmbeddedLaunch() && !isIframed())) {
     return <div className="min-h-screen flex items-center justify-center text-muted-foreground">Loading…</div>
   }
   if (!session) return <SignInPage appName={appName} />
@@ -270,12 +340,29 @@ export function AuthGate({ children, appName }: { children: ReactNode; appName: 
 
 ### Wrap Routes in `App.tsx`
 ```tsx
+import { useEffect } from 'react'
 import { AuthProvider } from '@/context/AuthProvider'
 import { AuthGate } from '@/components/AuthGate'
+import { supabase } from '@/lib/supabase'
+
+// If we're a popup window that just landed at the OAuth redirectTo, close
+// ourselves once Supabase has persisted the session. The parent listens
+// for the localStorage change in AuthProvider and re-renders signed in.
+function PopupSelfClose() {
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!window.opener || window.opener === window) return
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session) window.close()
+    })
+  }, [])
+  return null
+}
 
 export default function App() {
   return (
     <AuthProvider>
+      <PopupSelfClose />
       <AuthGate appName="My App">
         <Routes>
           {/* protected routes here */}
